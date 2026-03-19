@@ -43,6 +43,13 @@ export interface ClientConfiguration {
     loginUrl: string
     saveCredentials?: boolean
   }
+  /** S4/HANA Public Cloud configuration */
+  s4hPublicCloud?: {
+    /** Enable S4/HANA Public Cloud browser-based authentication */
+    enabled: boolean
+    /** Save the authentication ticket for session persistence */
+    saveCredentials?: boolean
+  }
   trace?: {
     mongoUrl: string
     api_methods: boolean

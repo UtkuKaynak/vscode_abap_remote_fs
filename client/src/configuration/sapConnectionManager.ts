@@ -129,6 +129,8 @@ export class SapConnectionManager {
           await this.createCloudConnectionFromServiceKey(message.serviceKey, message.target)
         } else if (message.cloudType === "endpoint") {
           await this.createCloudConnectionFromEndpoint(message.endpoint, message.target)
+        } else if (message.cloudType === "s4hPublicCloud") {
+          await this.createS4HPublicCloudConnection(message.target)
         }
         break
 
@@ -314,6 +316,11 @@ export class SapConnectionManager {
       cleaned.oauth = connection.oauth
     }
 
+    // Handle S4H Public Cloud configuration if present
+    if (connection.s4hPublicCloud) {
+      cleaned.s4hPublicCloud = connection.s4hPublicCloud
+    }
+
     // Cast to RemoteConfig - password field will be populated from credential manager at runtime
     return cleaned as RemoteConfig
   }
@@ -468,6 +475,86 @@ export class SapConnectionManager {
       this.panel.webview.postMessage({
         type: "error",
         message: `Failed to create cloud connection: ${error}`
+      })
+    }
+  }
+
+  private async createS4HPublicCloudConnection(target: "user" | "workspace") {
+    try {
+      // Get S4H URL from user
+      const url = await window.showInputBox({
+        prompt: "S4/HANA Public Cloud URL (e.g., https://my418012.s4hana.cloud.sap)",
+        placeHolder: "https://my000000.s4hana.cloud.sap",
+        ignoreFocusOut: true,
+        validateInput: (value: string) => {
+          if (!value) return "URL is required"
+          if (
+            !value.match(/^https:\/\/[\w\.-]+\.s4hana\.(cloud\.sap|ondemand\.com)(:\d+)?$/i)
+          ) {
+            return "Format: https://<tenant>.s4hana.cloud.sap or https://<tenant>.s4hana.ondemand.com"
+          }
+          return null
+        }
+      })
+      if (!url) return
+
+      // Import S4H authentication module
+      const { performS4HLoginForSetup } = await import("../oauth/s4hPublicCloud")
+
+      // Show progress while authenticating
+      const result = await window.withProgress(
+        {
+          location: vscode.ProgressLocation.Notification,
+          title: "S4/HANA Public Cloud Authentication",
+          cancellable: false
+        },
+        async progress => {
+          progress.report({ message: "Opening browser for authentication..." })
+
+          // Perform browser-based SSO and get system info
+          const authResult = await performS4HLoginForSetup(url)
+          return authResult
+        }
+      )
+
+      if (!result) {
+        this.panel.webview.postMessage({
+          type: "error",
+          message: "S4H authentication was cancelled or failed"
+        })
+        return
+      }
+
+      // Create S4H Public Cloud connection configuration with retrieved values
+      const connection: any = {
+        name: result.systemId,
+        url,
+        username: result.username,
+        password: "",
+        client: result.client,
+        language: result.language || "en",
+        allowSelfSigned: false,
+        diff_formatter: "ADT formatter",
+        s4hPublicCloud: {
+          enabled: true,
+          saveCredentials: false
+        }
+      }
+
+      // Send to webview for user to review/edit before saving
+      this.panel.webview.postMessage({
+        type: "cloudConnectionCreated",
+        connection: connection,
+        availableLanguages: result.languages || ["en"],
+        isS4HPublicCloud: true
+      })
+
+      logTelemetry("command_connection_manager_s4h_cloud_connection_created")
+    } catch (error) {
+      logCommands.error(`Error creating S4H Public Cloud connection: ${error}`)
+      this.panel.webview.postMessage({
+        type: "error",
+        message: `Failed to create S4H Public Cloud connection: ${error}`
       })
     }
   }
@@ -864,6 +951,7 @@ export class SapConnectionManager {
                             <div style="margin-bottom: 20px;">
                                 <label style="font-weight: 600; margin-bottom: 8px; display: block;">Select Cloud Type:</label>
                                 <select id="cloudTypeSelect" style="width: 100%; padding: 10px; background: var(--vscode-input-background); color: var(--vscode-input-foreground); border: 1px solid var(--vscode-input-border, var(--vscode-editorWidget-border)); font-size: 14px;">
+                                    <option value="S4HPUBLIC">S4/HANA Public Cloud (browser SSO)</option>
                                     <option value="LOADKEY">Load service key from file</option>
                                     <option value="EU10">Cloud instance - Europe trial (eu10)</option>
                                     <option value="US10">Cloud instance - USA trial (us10)</option>
@@ -1265,9 +1353,9 @@ export class SapConnectionManager {
                     </div>
                 </div>
                 <div class="form-row">
-                    <div class="form-group">
+                    <div class="form-group" id="usernameGroup">
                         <label for="username">Username *</label>
-                        <input type="text" id="username" name="username" required>
+                        <input type="text" id="username" name="username">
                         <div class="help-text">Password will be requested on first connection and stored securely in OS credential manager</div>
                     </div>
                 </div>
@@ -1417,6 +1505,7 @@ export class SapConnectionManager {
             const vscode = acquireVsCodeApi();
             let currentTarget = 'user';
             let editingConnectionKey = null; // Store the connection key (ID) being edited
+            let pendingS4HConfig = null; // Store S4H config for new cloud connections
             let connections = { user: {}, workspace: {} };
 
             // Initialize
@@ -1457,7 +1546,7 @@ export class SapConnectionManager {
                         showMessage(message.message, message.success ? 'success' : 'error');
                         break;
                     case 'cloudConnectionCreated':
-                        handleCloudConnection(message.connection, message.availableLanguages);
+                        handleCloudConnection(message.connection, message.availableLanguages, message.isS4HPublicCloud);
                         break;
                 }
             });
@@ -1695,13 +1784,16 @@ export class SapConnectionManager {
                 return labels[type] || type;
             }
 
-            function openEditor(connectionKey = null, connection = null) {
-                editingConnectionKey = connectionKey;
+            function openEditor(connectionKey = null, connection = null, isNewCloudConnection = false) {
+                // For new cloud connections, don't set editingConnectionKey since it's a new connection
+                editingConnectionKey = isNewCloudConnection ? null : connectionKey;
                 const modal = document.getElementById('editorModal');
                 const title = document.getElementById('modalTitle');
                 const form = document.getElementById('connectionForm');
                 const formError = document.getElementById('formError');
-                
+                const nameField = document.getElementById('name');
+                const usernameGroup = document.getElementById('usernameGroup');
+
                 // Clear any previous error messages
                 if (formError) {
                     formError.style.display = 'none';
@@ -1709,20 +1801,41 @@ export class SapConnectionManager {
                 }
 
                 if (connection) {
-                    title.textContent = 'Edit Connection: ' + connectionKey;
-                    populateForm(connectionKey, connection);
+                    if (isNewCloudConnection) {
+                        // New cloud connection - form is pre-filled but name is editable
+                        title.textContent = 'New Cloud Connection';
+                        nameField.readOnly = false;
+                        nameField.style.backgroundColor = '';
+                        nameField.style.opacity = '';
+                        nameField.title = '';
+                    } else {
+                        // Editing existing connection
+                        title.textContent = 'Edit Connection: ' + connectionKey;
+                    }
+                    populateForm(connectionKey, connection, isNewCloudConnection);
+
+                    // Hide username field for S4H Public Cloud connections (auth is browser-based)
+                    if (usernameGroup && (connection.s4hPublicCloud || connection._isS4HPublicCloud)) {
+                        usernameGroup.style.display = 'none';
+                    } else if (usernameGroup) {
+                        usernameGroup.style.display = '';
+                    }
                 } else {
                     title.textContent = 'Add New Connection';
-                    
+
                     // Re-enable name field BEFORE resetting form
-                    const nameField = document.getElementById('name');
                     nameField.readOnly = false;
                     nameField.style.backgroundColor = '';
                     nameField.style.opacity = '';
                     nameField.title = '';
-                    
+
+                    // Show username field for regular connections
+                    if (usernameGroup) {
+                        usernameGroup.style.display = '';
+                    }
+
                     form.reset();
-                    
+
                     // Set defaults
                     document.getElementById('language').value = 'en';
                     document.getElementById('diff_formatter').value = 'ADT formatter';
@@ -1740,20 +1853,25 @@ export class SapConnectionManager {
             function closeEditor() {
                 document.getElementById('editorModal').style.display = 'none';
                 editingConnectionKey = null;
+                pendingS4HConfig = null; // Clear pending S4H config
             }
 
-            function populateForm(connectionKey, conn) {
+            function populateForm(connectionKey, conn, isNewCloudConnection = false) {
                 const nameField = document.getElementById('name');
-                nameField.value = connectionKey;
-                // Make name field readonly when editing (cannot rename existing connections)
-                nameField.readOnly = true;
-                nameField.style.backgroundColor = 'var(--vscode-input-background)';
-                nameField.style.opacity = '0.6';
-                nameField.title = 'Change name in settings.json if needed.';
-                
-                document.getElementById('url').value = conn.url;
-                document.getElementById('username').value = conn.username;
-                document.getElementById('client').value = conn.client;
+                // Use connectionKey if provided, otherwise fall back to conn.name (for new cloud connections)
+                nameField.value = connectionKey || conn.name || '';
+
+                if (!isNewCloudConnection) {
+                    // Make name field readonly when editing (cannot rename existing connections)
+                    nameField.readOnly = true;
+                    nameField.style.backgroundColor = 'var(--vscode-input-background)';
+                    nameField.style.opacity = '0.6';
+                    nameField.title = 'Change name in settings.json if needed.';
+                }
+
+                document.getElementById('url').value = conn.url || '';
+                document.getElementById('username').value = conn.username || '';
+                document.getElementById('client').value = conn.client || '';
                 document.getElementById('language').value = (conn.language || 'en').toLowerCase();
                 document.getElementById('diff_formatter').value = conn.diff_formatter || 'ADT formatter';
                 document.getElementById('maxDebugThreads').value = conn.maxDebugThreads || 4;
@@ -1865,7 +1983,16 @@ export class SapConnectionManager {
                         return;
                     }
                 }
-                
+
+                // Validate username is provided for non-S4H connections
+                const username = formData.get('username');
+                const isS4HConnection = !!pendingS4HConfig || (editingConnectionKey && connections[currentTarget][editingConnectionKey]?.s4hPublicCloud);
+                if (!isS4HConnection && !username) {
+                    formError.textContent = 'Username is required';
+                    formError.style.display = 'block';
+                    return;
+                }
+
                 const connection = {
                     url: formData.get('url'),
                     username: formData.get('username'),
@@ -1892,12 +2019,19 @@ export class SapConnectionManager {
                 
                 const connectionId = editingConnectionKey || formData.get('name');
 
-                // Preserve OAuth config if editing a cloud connection
+                // Preserve OAuth or S4H config if editing a cloud connection
                 if (editingConnectionKey) {
                     const existingConn = connections[currentTarget][editingConnectionKey];
                     if (existingConn && existingConn.oauth) {
                         connection.oauth = existingConn.oauth;
                     }
+                    if (existingConn && existingConn.s4hPublicCloud) {
+                        connection.s4hPublicCloud = existingConn.s4hPublicCloud;
+                    }
+                } else if (pendingS4HConfig) {
+                    // New S4H cloud connection - add the S4H config
+                    connection.s4hPublicCloud = pendingS4HConfig;
+                    pendingS4HConfig = null; // Clear after use
                 }
 
                 vscode.postMessage({
@@ -1966,8 +2100,18 @@ export class SapConnectionManager {
             function processCloudConnection() {
                 const cloudType = document.getElementById('cloudTypeSelect').value;
                 let endpoint = '';
-                
+
                 switch (cloudType) {
+                    case 'S4HPUBLIC':
+                        // S4H Public Cloud - close modal and let backend handle input dialogs
+                        vscode.postMessage({
+                            type: 'createCloudConnection',
+                            cloudType: 's4hPublicCloud',
+                            target: currentTarget
+                        });
+                        closeCloudModal();
+                        return;
+
                     case 'LOADKEY':
                         const serviceKey = document.getElementById('serviceKeyInput').value.trim();
                         if (!serviceKey) {
@@ -2026,13 +2170,22 @@ export class SapConnectionManager {
                 closeCloudModal();
             }
 
-            function handleCloudConnection(connection, availableLanguages) {
+            function handleCloudConnection(connection, availableLanguages, isS4HPublicCloud = false) {
                 // Store available languages for the cloud connection
                 connection._availableLanguages = availableLanguages;
-                
+                connection._isS4HPublicCloud = isS4HPublicCloud;
+
+                // Store S4H config for new cloud connections (will be added during save)
+                if (isS4HPublicCloud && connection.s4hPublicCloud) {
+                    pendingS4HConfig = connection.s4hPublicCloud;
+                } else {
+                    pendingS4HConfig = null;
+                }
+
                 // Open editor with pre-filled cloud connection data
-                openEditor(connection);
-                
+                // Pass connection.name as the key and the connection object
+                openEditor(connection.name, connection, true);
+
                 showMessage('Cloud connection created. Please review and save.', 'success');
             }
 

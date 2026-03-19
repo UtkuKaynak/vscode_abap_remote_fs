@@ -7,10 +7,10 @@ import {
   session_types
 } from "abap-adt-api"
 import { readFileSync, writeFileSync, existsSync, mkdirSync } from "fs"
-import { log, caughtToString, ignore, isUnDefined, firstInMap } from "../../lib"
+import { log, caughtToString, ignore } from "../../lib"
 import { DebugProtocol } from "@vscode/debugprotocol"
 import { Disposable, EventEmitter } from "vscode"
-import { getOrCreateClient } from "../conections"
+import { getOrCreateClient, getClient } from "../conections"
 import { homedir } from "os"
 import { join } from "path"
 import { StoppedEvent, TerminatedEvent, ThreadEvent } from "@vscode/debugadapter"
@@ -18,6 +18,7 @@ import { v1 } from "uuid"
 import { getWinRegistryReader } from "./winregistry"
 import { context } from "../../extension"
 import { DebugService, isEnded } from "./debugService"
+import { cloneClientWithSharedSession } from "./functions"
 import { BreakpointManager } from "./breakpointManager"
 import { VariableManager } from "./variableManager"
 import { configFromKey } from "../../langClient"
@@ -92,10 +93,19 @@ export class DebugListener {
   private currentThreadId?: number
   private threadCreation?: Promise<void>
   maxThreads = 4
+  private _isS4H = false
 
   public get client() {
     if (this.killed) throw new Error("Disconnected")
     return this._client
+  }
+
+  /**
+   * Returns true if this is an S4H Public Cloud connection.
+   * Used by BreakpointManager to determine which client to use for breakpoint operations.
+   */
+  public get isS4H() {
+    return this._isS4H
   }
 
   activeServices() {
@@ -108,7 +118,8 @@ export class DebugListener {
     readonly terminalId: string,
     readonly username: string,
     terminalMode: boolean,
-    private ui: DebuggerUI
+    private ui: DebuggerUI,
+    isS4H = false
   ) {
     this.sessionNumber = (sessionNumbers.get(connId) || 0) + 1
     sessionNumbers.set(connId, this.sessionNumber)
@@ -117,6 +128,7 @@ export class DebugListener {
     if (!this.username) this.username = _client.username.toUpperCase()
     this.breakpointManager = new BreakpointManager(this)
     this.variableManager = new VariableManager(this)
+    this._isS4H = isS4H
   }
 
   public static async create(
@@ -125,10 +137,17 @@ export class DebugListener {
     username: string,
     terminalMode: boolean
   ) {
-    const client = await getOrCreateClient(connId)
-    if (!client) throw new Error(`Unable to get client for${connId}`)
+    const conf = await configFromKey(connId)
+    const isS4H = !!conf?.s4hPublicCloud?.enabled
+
+    // For S4H: Get main client (not clone) so listener and attach use same session
+    // This is critical because the debuggee is registered on the session that calls
+    // debuggerListen(), and must be attached from the same session.
+    // getOrCreateClient defaults to clone=true, so we need clone=false for S4H.
+    const client = await getOrCreateClient(connId, !isS4H)
+    if (!client) throw new Error(`Unable to get client for ${connId}`)
     const terminalId = await getOrCreateTerminalId()
-    return new DebugListener(connId, client, terminalId, username, terminalMode, ui)
+    return new DebugListener(connId, client, terminalId, username, terminalMode, ui, isS4H)
   }
 
   addListener(listener: (e: DebugProtocol.Event) => any, thisArg?: any) {
@@ -153,14 +172,70 @@ export class DebugListener {
     if (norestart) {
       this.active = false
     }
-    const c = this._client.statelessClone
+    // For S4H: use main client to match the session used for listening
+    // This ensures we delete the listener from the same session that created it
+    const c = this._isS4H ? this._client : this._client.statelessClone
     return c.debuggerDeleteListener(this.mode, this.terminalId, this.ideId, this.username)
+  }
+
+  /**
+   * Clear all external breakpoints from the server for this user/terminal/ide.
+   * This is used on S4H restart to ensure old breakpoints from previous sessions
+   * don't interfere with the new session. VS Code will re-send all breakpoints
+   * via setBreakPointsRequest after the debug session starts.
+   *
+   * Eclipse ADT achieves this with BreakpointsSynchronizationMode.FULL with an empty
+   * breakpoint list, which tells SAP "sync to this (empty) list = delete everything".
+   *
+   * abap-adt-api parameters:
+   * debuggerSetBreakpoints(mode, terminalId, ideId, clientId, breakpoints, user, scope, systemDebugging, deactivated, syncScopeUri)
+   * When syncScopeUri is empty string, it triggers <syncScope mode="full"> which syncs all breakpoints.
+   */
+  private async clearAllExternalBreakpoints(): Promise<void> {
+    const client = this._isS4H ? this._client : this._client.statelessClone
+
+    // Call debuggerSetBreakpoints with empty array and empty syncScopeUri (triggers full sync)
+    // This tells SAP to sync its breakpoints to our list (empty), effectively deleting all
+    try {
+      await client.debuggerSetBreakpoints(
+        this.mode,
+        this.terminalId,
+        this.ideId,
+        `clear:${this.connId}`,  // clientId - just needs to be unique
+        [],                       // empty breakpoint list - SAP will sync to this (delete all)
+        this.username,
+        "external",               // scope - external breakpoints (not debugger session breakpoints)
+        false,                    // systemDebugging - false for normal debugging
+        false,                    // deactivated - false, we want active breakpoints
+        ""                        // syncScopeUri - empty string triggers mode="full" sync
+      )
+      log(`clearAllExternalBreakpoints: successfully cleared external breakpoints`)
+    } catch (error) {
+      // Log but don't throw - this is a best-effort cleanup
+      log(`clearAllExternalBreakpoints: error (continuing anyway): ${caughtToString(error)}`)
+    }
+  }
+
+  /**
+   * Get the client to use for debug listener operations.
+   *
+   * For S4H Public Cloud: Use main client directly to ensure the debuggee
+   * is registered on the same session that will be used for attach.
+   * The statelessClone creates a separate session, which causes "invalidDebuggee"
+   * errors because the debuggee doesn't exist in the attach client's session.
+   *
+   * For other auth types: Use statelessClone as before (separate session for listener)
+   */
+  private getListenerClient() {
+    return this._isS4H ? this._client : this._client.statelessClone
   }
 
   private debuggerListen() {
     try {
       this.listening = true
-      return this.client.statelessClone.debuggerListen(
+      const listenerClient = this.getListenerClient()
+      log(`debuggerListen: isS4H=${this._isS4H}, usingMainClient=${listenerClient === this._client}`)
+      return listenerClient.debuggerListen(
         this.mode,
         this.terminalId,
         this.ideId,
@@ -172,7 +247,11 @@ export class DebugListener {
   }
 
   private async hasConflict(): Promise<ConflictResult> {
-    const client = (await newClientFromKey(this.connId)) || this.client
+    // For S4H: use main client (can't create new clients with MYSAPSSO2)
+    // For non-S4H: create a fresh client to check for conflicts (original behavior)
+    const client = this._isS4H
+      ? this.client
+      : (await newClientFromKey(this.connId)) || this.client
     try {
       await client.debuggerListeners(this.mode, this.terminalId, this.ideId, this.username)
     } catch (error: any) {
@@ -191,6 +270,25 @@ export class DebugListener {
 
   public async fireMainLoop(): Promise<boolean> {
     try {
+      // For S4H: Clear ALL external breakpoints from the server FIRST
+      // This is needed because on restart, old breakpoints from previous sessions might still
+      // exist on SAP side. Eclipse ADT uses BreakpointsSynchronizationMode.FULL which syncs
+      // the server's breakpoints to match the IDE's breakpoints. Since we're starting fresh,
+      // we clear everything and let VS Code re-send all breakpoints via setBreakPointsRequest.
+      // We do this BEFORE stopListener to ensure the session is in a known-good state.
+      if (this._isS4H) {
+        log(`fireMainLoop: S4H mode - clearing old external breakpoints from server`)
+        await this.clearAllExternalBreakpoints().catch(e =>
+          log(`fireMainLoop: failed to clear old breakpoints (non-fatal): ${caughtToString(e)}`)
+        )
+      }
+
+      // Following Eclipse ADT pattern: Always clean up any existing listener before starting
+      // This clears stale debuggees from previous sessions that used the same ideId/terminalId
+      // Eclipse calls stopWaitingForDebuggeeSessions() in scheduleCleanupAndRestartJob()
+      log(`fireMainLoop: cleaning up any existing listener before starting`)
+      await this.stopListener().catch(e => log(`fireMainLoop: cleanup ignored (expected if no existing listener): ${caughtToString(e)}`))
+
       const conflict = await this.hasConflict()
       switch (conflict.with) {
         case "myself":
@@ -239,7 +337,17 @@ export class DebugListener {
           break
         }
         log(`Debugger ${this.sessionNumber} on connection  ${this.connId} reached a breakpoint`)
-        this.onBreakpointReached(debuggee)
+        // For S4H: We MUST wait for attach to complete before restarting listener
+        // Since S4H uses the same client for listener and attach, concurrent
+        // requests would interfere. The debuggerListen POST and debuggerAttach POST
+        // cannot run in parallel on the same session.
+        if (this._isS4H) {
+          await this.onBreakpointReached(debuggee)
+        } else {
+          // For non-S4H: Start attach in background, listener can restart immediately
+          // (they use different clients so no conflict)
+          this.onBreakpointReached(debuggee)
+        }
       } catch (error) {
         if (!this.active) return
         if (!isAdtError(error)) {
@@ -285,14 +393,22 @@ export class DebugListener {
   }
 
   private async onBreakpointReached(debuggee: Debuggee) {
+    log(`>>> onBreakpointReached START`)
     try {
+      // Log debuggee details for debugging
+      log(`onBreakpointReached: debuggeeId=${debuggee.DEBUGGEE_ID}, user=${debuggee.DEBUGGEE_USER}, program=${debuggee.PRG_CURR}, line=${debuggee.LINE_CURR}, isAttachImpossible=${debuggee.IS_ATTACH_IMPOSSIBLE}`)
+
       if (this.services.size >= this.maxThreads) return this.resume(debuggee)
+      log(`onBreakpointReached: creating DebugService...`)
       const service = await DebugService.create(this.connId, this.ui, this, debuggee)
+      log(`onBreakpointReached: DebugService created successfully`)
       const threadid = this.nextthreadid()
       service.threadId = threadid
       this.services.set(threadid, service)
       const creation = (async () => {
+        log(`onBreakpointReached: calling service.attach()...`)
         await service.attach()
+        log(`onBreakpointReached: service.attach() completed`)
         service.addListener(e => {
           if (e instanceof ThreadEvent && e.body.reason === THREAD_EXITED) this.stopThread(threadid)
           this.notifier.fire(e)
@@ -302,27 +418,67 @@ export class DebugListener {
       })()
       this.threadCreation = creation.finally(() => (this.threadCreation = undefined))
       await creation
-    } catch (error) {
-      log(`${error}`)
+      log(`onBreakpointReached: completed successfully`)
+      log(`<<< onBreakpointReached END (success)`)
+    } catch (error: any) {
+      // Check if this is an "invalidDebuggee" error - this happens when we receive
+      // a stale debuggee from a previous session. The debuggee was registered on a
+      // different SAP session that no longer exists, so we can't attach to it.
+      // In this case, just log and continue listening - don't stop the debugger.
+      const errType = errorType(error)
+      log(`<<< onBreakpointReached CATCH: errorType=${errType}, error=${caughtToString(error)}`)
+      if (errType === "invalidDebuggee") {
+        log(`Skipping stale debuggee ${debuggee.DEBUGGEE_ID} (invalidDebuggee error - likely from a previous session)`)
+        // Try to resume/cleanup the stale debuggee
+        await this.resume(debuggee).catch(e => log(`Failed to resume stale debuggee: ${e}`))
+        return  // Continue listening
+      }
+
+      log(`onBreakpointReached: stopping debugging due to error`)
       await this.stopDebugging()
     }
   }
+
   private async resume(debuggee: Debuggee) {
+    log(`resume: starting for debuggeeId=${debuggee.DEBUGGEE_ID}`)
     try {
-      const client = await newClientFromKey(this.connId)
-      if (!client) throw new Error("Failed to connect to debuggee")
-      client.stateful = session_types.stateful
+      let client: ADTClient
+
+      // For S4H Public Cloud, create a client sharing the session with the listener
+      // This allows concurrent HTTP requests while staying on the same SAP session
+      if (this._isS4H) {
+        const mainClient = getClient(this.connId, false)
+        const clonedClient = await cloneClientWithSharedSession(mainClient, this.connId)
+        if (!clonedClient) throw new Error("Failed to clone client for resume")
+        clonedClient.stateful = session_types.stateful
+        client = clonedClient
+        log(`resume: S4H mode, using cloned client sharing session`)
+      } else {
+        const existingClient = await newClientFromKey(this.connId)
+        if (!existingClient) throw new Error("Failed to connect to debuggee")
+        existingClient.stateful = session_types.stateful
+        client = existingClient
+      }
+
       try {
+        log(`resume: calling debuggerAttach...`)
         await client.debuggerAttach(this.mode, debuggee.DEBUGGEE_ID, this.username, true)
+        log(`resume: attach succeeded, stepping continue...`)
         while (true) await client.debuggerStep("stepContinue")
       } catch (error) {
-        if (isEnded(error)) return
-        log(`${error}`)
+        if (isEnded(error)) {
+          log(`resume: debuggee ended (normal)`)
+          return
+        }
+        log(`resume: attach/step error: ${caughtToString(error)}`)
       } finally {
-        client.logout()
+        // S4H: Don't logout - would invalidate shared session used by filesystem
+        if (!this._isS4H) {
+          client.logout()
+        }
       }
     } catch (error) {
-      log(`${error}`)
+      log(`resume: outer error: ${caughtToString(error)}`)
       await this.stopDebugging()
     }
   }
@@ -344,10 +500,25 @@ export class DebugListener {
     this.active = false
     if (this.killed) return
     this.killed = true
+
+    // For S4H: Clear all external breakpoints on logout
+    // This ensures breakpoints don't interfere with the next session,
+    // especially if the user changes the debug user.
+    if (this._isS4H) {
+      log(`logout: S4H mode - clearing external breakpoints`)
+      await this.clearAllExternalBreakpoints().catch(e =>
+        log(`logout: failed to clear breakpoints (non-fatal): ${caughtToString(e)}`)
+      )
+    }
+
     if (this.listening) await this.stopListener().catch(ignore)
     else {
-      const conflict = await this.hasConflict()
-      if (conflict.with === "myself") await this.stopListener().catch(ignore)
+      try {
+        const conflict = await this.hasConflict()
+        if (conflict.with === "myself") await this.stopListener().catch(ignore)
+      } catch (error) {
+        // Ignore errors during logout - we're just trying to clean up
+      }
     }
     const stopServices = [...this.services.keys()].map(s => this.stopThread(s))
     const proms: Promise<any>[] = [...stopServices]

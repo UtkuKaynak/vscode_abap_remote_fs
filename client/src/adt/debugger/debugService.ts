@@ -1,11 +1,13 @@
 import { ADTClient, Debuggee, DebugStepType, session_types, isAdtError } from "abap-adt-api"
-import { newClientFromKey } from "./functions"
+import { newClientFromKey, cloneClientWithSharedSession } from "./functions"
+import { configFromKey } from "../../langClient"
 import { log, caughtToString, ignore } from "../../lib"
 import { DebugProtocol } from "@vscode/debugprotocol"
 import { Disposable, EventEmitter } from "vscode"
 import { ContinuedEvent, Source, StoppedEvent, ThreadEvent } from "@vscode/debugadapter"
 import { vsCodeUri } from "../../langClient"
 import { DebugListener, errorType, THREAD_EXITED } from "./debugListener"
+import { getClient } from "../conections"
 export const STACK_THREAD_MULTIPLIER = 1000000000000
 
 export interface DebuggerUI {
@@ -27,14 +29,18 @@ export class DebugService {
   private listeners: Disposable[] = []
   private _stackTrace: StackFrame[] = []
   public threadId: number = 0
+  private _isS4H = false
 
   constructor(
     private connId: string,
     private _client: ADTClient,
     private listener: DebugListener,
     readonly debuggee: Debuggee,
-    private ui: DebuggerUI
-  ) {}
+    private ui: DebuggerUI,
+    isS4H = false
+  ) {
+    this._isS4H = isS4H
+  }
 
   get client() {
     if (this.killed) throw new Error("Disconnected")
@@ -57,20 +63,67 @@ export class DebugService {
     listener: DebugListener,
     debuggee: Debuggee
   ) {
-    const client = await newClientFromKey(connId, { timeout: 7200000 })
-    if (!client) throw new Error(`Unable to create client for${connId}`)
-    client.stateful = session_types.stateful
-    await client.adtCoreDiscovery()
-    const service = new DebugService(connId, client, listener, debuggee, ui)
+    const conf = await configFromKey(connId)
+    if (!conf) throw new Error(`Unable to get config for ${connId}`)
+
+    let client: ADTClient
+    let isS4H = false
+
+    // For S4H Public Cloud, we need a separate HTTP client for concurrent requests
+    // (listener + attach), but must share the same SAP session.
+    //
+    // Key insight: The debuggee is bound to the SAP session (identified by cookies).
+    // We create a new HTTP client but copy the session cookies from the listener's client.
+    // This allows concurrent HTTP requests while staying on the same SAP session.
+    // login() and adtCoreDiscovery() are also skipped as they are already done on the main client.
+
+    // We mark it as S4H to skip logout() later (which would invalidate the shared session).
+    if (conf.s4hPublicCloud?.enabled) {
+      isS4H = true
+      // Get the main client that the listener is using
+      const mainClient = getClient(connId, false)
+      // Create a new client that shares the session (cookies, CSRF token, bearer)
+      const newClient = await cloneClientWithSharedSession(mainClient, connId, { timeout: 7200000 })
+      if (!newClient) throw new Error(`Unable to create client for ${connId}`)
+      newClient.stateful = session_types.stateful
+      client = newClient
+      log(`DebugService.create: S4H mode, created client sharing session with listener`)
+    } else {
+      const newClient = await newClientFromKey(connId, { timeout: 7200000 })
+      if (!newClient) throw new Error(`Unable to create client for ${connId}`)
+      newClient.stateful = session_types.stateful
+      client = newClient
+      await client.adtCoreDiscovery()
+    }
+
+    const service = new DebugService(connId, client, listener, debuggee, ui, isS4H)
     return service
   }
+
   public async attach() {
-    await this.client.debuggerAttach(this.mode, this.debuggee.DEBUGGEE_ID, this.username, true)
+    try {
+      log(`debuggerAttach: mode=${this.mode}, debuggeeId=${this.debuggee.DEBUGGEE_ID}, username=${this.username}, isS4H=${this._isS4H}`)
+      await this.client.debuggerAttach(this.mode, this.debuggee.DEBUGGEE_ID, this.username, true)
+      log(`debuggerAttach SUCCEEDED for ${this.debuggee.DEBUGGEE_ID}`)
+    } catch (error: any) {
+      // Log full error details for debugging
+      log(`debuggerAttach FAILED: ${caughtToString(error)}`)
+      throw error
+    }
     // Fire saveSettings in background - not critical for attach
+    log(`debuggerSaveSettings: starting (background)`)
     this.client.debuggerSaveSettings({}).catch(e => {
-      log(caughtToString(e))
+      log(`debuggerSaveSettings FAILED: ${caughtToString(e)}`)
     })
-    await this.updateStack()
+    try {
+      log(`updateStack: starting`)
+      await this.updateStack()
+      log(`updateStack: completed`)
+    } catch (error: any) {
+      log(`updateStack FAILED: ${caughtToString(error)}`)
+      throw error
+    }
+    log(`attach(): completed successfully`)
   }
 
   addListener(listener: (e: DebugProtocol.Event) => any, thisArg?: any) {
@@ -109,7 +162,11 @@ export class DebugService {
   }
 
   private async updateStack() {
-    const stackInfo = await this.client.debuggerStackTrace(false).catch(() => undefined)
+    const stackInfo = await this.client.debuggerStackTrace(false).catch(e => {
+      log(`debuggerStackTrace FAILED: ${caughtToString(e)}`)
+      return undefined
+    })
+    log(`debuggerStackTrace returned: ${stackInfo ? `${stackInfo.stack?.length || 0} frames` : 'undefined'}`)
     this.listener.variableManager.resetHandle(this.threadId)
     const createFrame = (
       path: string,
@@ -136,18 +193,26 @@ export class DebugService {
         }
       })
       this._stackTrace = (await Promise.all(stackp)).filter(s => !!s)
+      log(`updateStack: built ${this._stackTrace.length} frames`)
+    } else {
+      log(`updateStack: no stackInfo, stack trace will be empty`)
     }
   }
 
   public async logout() {
     if (this.killed) return
-    const client = this.client
     this.killed = true
     // Dispose all event listeners to prevent memory leaks
     this.listeners.forEach(l => l.dispose())
     this.listeners = []
     this.notifier.dispose()
-    await client.statelessClone.logout().catch(ignore)
-    await client.logout()
+
+    // S4H: Don't logout - would invalidate main session used by filesystem
+    // Following Eclipse ADT pattern: debug sessions share destination with main client
+    if (!this._isS4H) {
+      // Non-S4H: logout the client (each debug service has its own client)
+      await this._client.statelessClone.logout().catch(ignore)
+      await this._client.logout()
+    }
   }
 }

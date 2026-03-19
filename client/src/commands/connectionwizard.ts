@@ -22,7 +22,8 @@ import {
 import { Token } from "client-oauth2"
 import { pipe } from "fp-ts/lib/function"
 import { bind, chain, map } from "fp-ts/lib/TaskEither"
-import { ConfigurationTarget, QuickPickItem, Uri, workspace } from "vscode"
+import { ConfigurationTarget, QuickPickItem, Uri, workspace, ProgressLocation } from "vscode"
+import { funWindow as window } from "../services/funMessenger"
 import { ClientConfiguration } from "vscode-abap-remote-fs-sharedapi"
 import { saveNewRemote, validateNewConfigId } from "../config"
 import {
@@ -41,7 +42,7 @@ import {
 } from "../lib"
 
 interface SimpleSource extends QuickPickItem {
-  key: "LOADKEY" | "MANUAL" | "NONCLOUD"
+  key: "LOADKEY" | "MANUAL" | "NONCLOUD" | "S4HPUBLIC"
 }
 interface UrlSource extends QuickPickItem {
   key: "URL"
@@ -50,6 +51,7 @@ interface UrlSource extends QuickPickItem {
 type Source = SimpleSource | UrlSource
 const CONFIGSOURCES: Source[] = [
   { label: "Known application server", key: "NONCLOUD" },
+  { label: "S4/HANA Public Cloud (browser SSO)", key: "S4HPUBLIC", description: "Uses Eclipse ADT-style authentication" },
   { label: "Cloud instance - load service key from file", key: "LOADKEY" },
   {
     label: "Cloud instance - Europe trial",
@@ -226,6 +228,84 @@ const inputLanguage = () =>
       x.match(/^[a-z][a-z]$/) ? "" : "Language code must be 2 lowercase letters"
   })
 
+const inputS4HUrl = () =>
+  inputBox({
+    prompt: "S4/HANA Public Cloud URL (e.g., https://my418012.s4hana.cloud.sap)",
+    value: "https://my000000.s4hana.cloud.sap",
+    validateInput: (url: string) =>
+      url && url.match(/^https:\/\/[\w\.-]+\.s4hana\.(cloud\.sap|ondemand\.com)(:\d+)?$/i)
+        ? ""
+        : "Format: https://<tenant>.s4hana.cloud.sap or https://<tenant>.s4hana.ondemand.com"
+  })
+
+/**
+ * Configuration flow for S4/HANA Public Cloud connections
+ * Uses browser-based SSO authentication via reentrance ticket
+ * Opens browser immediately after URL input, retrieves system info after auth
+ */
+const s4hPublicCloudConfig = () =>
+  pipe(
+    rfsTaskEither({}),
+    bind("url", inputS4HUrl),
+    bind("authResult", ({ url }) =>
+      rfsTryCatch(async () => {
+        const { performS4HLoginForSetup } = await import("../oauth/s4hPublicCloud")
+
+        const result = await window.withProgress(
+          {
+            location: ProgressLocation.Notification,
+            title: "S4/HANA Public Cloud Authentication",
+            cancellable: false
+          },
+          async progress => {
+            progress.report({ message: "Opening browser for authentication..." })
+            return performS4HLoginForSetup(url)
+          }
+        )
+
+        if (!result) {
+          throw new Error("S4H authentication was cancelled or failed")
+        }
+        return result
+      })
+    ),
+    map(({ url, authResult }) => {
+      const config: ClientConfiguration = {
+        name: authResult.systemId,
+        url,
+        username: authResult.username,
+        password: "",
+        language: authResult.language || "en",
+        client: authResult.client,
+        allowSelfSigned: false,
+        diff_formatter: "ADT formatter",
+        s4hPublicCloud: {
+          enabled: true,
+          saveCredentials: false
+        }
+      }
+      return { config, languages: authResult.languages }
+    })
+  )
+
+/**
+ * Save S4/HANA Public Cloud configuration
+ */
+const saveS4HConfig = (cfg: RfsTaskEither<{ config: ClientConfiguration; languages: string[] }>) =>
+  pipe(
+    cfg,
+    bind("destination", pickDestination),
+    bind("name", inputName),
+    bind("language", c => quickPick(c.languages, { placeHolder: "Select language" })),
+    bind("saveCredentials", _ => askConfirmation("Save authentication ticket between sessions?")),
+    map(x => {
+      const { config, name, destination, language, saveCredentials } = x
+      const s4hPublicCloud = config.s4hPublicCloud && { ...config.s4hPublicCloud, saveCredentials }
+      const newConfig = { ...config, name, language, s4hPublicCloud }
+      return saveNewRemote(newConfig, destination)
+    })
+  )
+
 const localConfig = () =>
   pipe(
     rfsTaskEither({}),
@@ -316,6 +396,8 @@ export const createConnection = async () => {
           )()
         case "URL":
           return pipe(configFromUrl(x.url), saveCloudConfig)()
+        case "S4HPUBLIC":
+          return pipe(s4hPublicCloudConfig(), saveS4HConfig)()
         case "NONCLOUD":
           return pipe(localConfig(), saveLocal)()
       }

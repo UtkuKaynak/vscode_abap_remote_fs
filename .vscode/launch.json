@@ -20,6 +20,23 @@
       ],
       "outFiles": [
         "${workspaceFolder}/client/dist/**/*.js"
+      ]
+    },
+    {
+      "name": "Client (with watch)",
+      "type": "extensionHost",
+      "request": "launch",
+      "skipFiles": [
+        "<node_internals>/**",
+        "async_hooks.js"
+      ],
+      "runtimeExecutable": "${execPath}",
+      "args": [
+        "--extensionDevelopmentPath=${workspaceFolder}",
+        "--async-stack-traces"
+      ],
+      "outFiles": [
+        "${workspaceFolder}/client/dist/**/*.js"
       ],
       "preLaunchTask": "watch client"
     },

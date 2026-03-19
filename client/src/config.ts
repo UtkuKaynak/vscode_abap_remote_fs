@@ -18,7 +18,7 @@ import { ADTClient, createSSLConfig, LogCallback } from "abap-adt-api"
 import { readFileSync } from "fs"
 import { createProxy } from "method-call-logger"
 import { mongoApiLogger, mongoHttpLogger, PasswordVault } from "./lib"
-import { oauthLogin } from "./oauth"
+import { oauthLogin, s4hPublicCloudLogin, getS4HTicket, getCachedApiUrl } from "./oauth"
 import { ADTSCHEME } from "./adt/conections"
 
 const CONFIGROOT = "abapfs"
@@ -92,7 +92,9 @@ export const saveNewRemote = async (cfg: ClientConfiguration, target: Configurat
 
 const config = (name: string, remote: RemoteConfig) => {
   const conf = { ...defaultConfig, ...remote, name, valid: true }
-  conf.valid = !!(remote.url && remote.username) // ✅ SECURITY FIX: Removed password validation from settings
+  // S4H Public Cloud connections don't require username - auth is browser-based
+  const isS4HConnection = !!remote.s4hPublicCloud?.enabled
+  conf.valid = !!(remote.url && (isS4HConnection || remote.username)) // ✅ SECURITY FIX: Removed password validation from settings
   if (conf.customCA && !conf.customCA.match(/-----BEGIN CERTIFICATE-----/gi))
     try {
       conf.customCA = readFileSync(conf.customCA).toString()
@@ -166,10 +168,166 @@ export function createClient(conf: RemoteConfig) {
     ? createSSLConfig(conf.allowSelfSigned, conf.customCA)
     : {}
   sslconf.debugCallback = httpLogger(conf)
+
+  // For S4H Public Cloud, we need to use MYSAPSSO2 cookie instead of Bearer token
+  // The reentrance ticket is passed as a cookie, not an Authorization header
+  // CRITICAL: S4H Public Cloud has SEPARATE API and UI hosts!
+  if (conf.s4hPublicCloud?.enabled) {
+    const s4hLogin = s4hPublicCloudLogin(conf)
+    if (s4hLogin) {
+      // For S4H, use placeholder username and a custom login mechanism
+      const username = conf.username || "S4H_SSO_USER"
+
+      // Get the API URL - S4H has separate API and UI hosts
+      // The ticket is obtained from UI host but API calls go to API host
+      // IMPORTANT: Check cached API URL first (discovered during setup or previous login)
+      // The ticket data might not exist yet at client creation time
+      const ticketData = getS4HTicket(conf.name)
+      const cachedApiUrl = getCachedApiUrl(conf.url)
+      const apiUrl = ticketData?.apiUrl || cachedApiUrl || conf.url
+
+      // Shared state between main client and clone
+      // This ensures cookies and CSRF token are shared
+      const sharedState = {
+        ticket: null as string | null,
+        csrfToken: null as string | null,
+        cookies: new Map<string, string>(),
+        loginComplete: false
+      }
+
+      // Helper function to override the login method on any ADTClient's httpClient
+      const overrideLogin = (httpClient: any, isClone = false) => {
+        httpClient.login = async function() {
+          // If main client already logged in, clone can reuse the session
+          if (isClone && sharedState.loginComplete) {
+            // Copy shared state to this client
+            this.commonHeaders = this.commonHeaders || {}
+            if (sharedState.ticket) {
+              this.commonHeaders["MYSAPSSO2"] = sharedState.ticket
+            }
+            if (sharedState.csrfToken) {
+              this.csrfToken = sharedState.csrfToken
+            }
+            // Copy cookies
+            for (const [key, value] of sharedState.cookies) {
+              this.cookie.set(key, value)
+            }
+            return
+          }
+
+          // Check if we already have a valid session (SAP_SESSIONID cookie present)
+          const currentCookies = this.ascookies?.() || ""
+          if (currentCookies.includes("SAP_SESSIONID")) {
+            return
+          }
+
+          if (this.loginPromise) {
+            return this.loginPromise
+          }
+
+          this.loginPromise = (async () => {
+            try {
+              // Get the reentrance ticket via browser SSO
+              const ticket = await s4hLogin()
+
+              // Store ticket in shared state
+              sharedState.ticket = ticket
+
+              // CRITICAL: Clear ALL existing cookies before S4H authentication
+              // Old SAML state cookies can interfere with the MYSAPSSO2 authentication
+              this.cookie.clear()
+
+              // Clear any existing auth methods
+              this.auth = undefined
+              this.bearer = undefined
+
+              // Set the MYSAPSSO2 as BOTH a header AND a cookie (Eclipse ADT does both)
+              // The header is the primary auth mechanism for S4H Public Cloud
+              this.commonHeaders = this.commonHeaders || {}
+              this.commonHeaders["MYSAPSSO2"] = ticket
+
+              // FIX: Cookie format should be just the ticket value, not "MYSAPSSO2=ticket"
+              // The cookie.set() method already creates "key=value" format
+              this.cookie.set("MYSAPSSO2", ticket)
+
+              // Build query params
+              const qs: any = {}
+              if (this.client) qs["sap-client"] = this.client
+              if (this.language) qs["sap-language"] = this.language
+
+              // CRITICAL: Eclipse ADT sends x-sap-security-session: create to establish a session
+              // This tells the SAP server to create a new security session with the provided ticket
+              const headers: any = {
+                "x-sap-security-session": "create",
+                // Also add the sap-adt-purpose header that Eclipse uses
+                "sap-adt-purpose": "logon"
+              }
+
+              // Fetch CSRF token with the MYSAPSSO2 header and session creation request
+              this.csrfToken = "fetch"
+              await this._request("/sap/bc/adt/compatibility/graph", { qs, headers })
+
+              // Store session state for sharing with clone
+              sharedState.csrfToken = this.csrfToken
+              sharedState.loginComplete = true
+              // Copy cookies to shared state
+              for (const [key, value] of this.cookie) {
+                sharedState.cookies.set(key, value)
+              }
+            } finally {
+              this.loginPromise = undefined
+            }
+          })()
+
+          return this.loginPromise
+        }
+      }
+
+      // CRITICAL: Use API URL, not the base URL!
+      // S4H Public Cloud has separate hosts for UI (browser auth) and API (ADT calls)
+      const client = new ADTClient(
+        apiUrl,  // Use API URL here!
+        username,
+        "DUMMY_WILL_BE_OVERRIDDEN", // Password is not used - we override login
+        conf.client,
+        conf.language,
+        sslconf
+      )
+
+      // Override the login method on the main client
+      overrideLogin(client.httpClient, false)
+
+      // Override statelessClone to ensure cloned clients also use S4H auth
+      // This is critical because nodeContents and other APIs use statelessClone
+      const originalStatelessCloneGetter = Object.getOwnPropertyDescriptor(
+        Object.getPrototypeOf(client),
+        "statelessClone"
+      )
+
+      Object.defineProperty(client, "statelessClone", {
+        get: function() {
+          // Call the original getter to get/create the clone
+          const clone = originalStatelessCloneGetter?.get?.call(this)
+          if (clone && !clone._s4hLoginOverridden) {
+            // Override login on the clone's httpClient too
+            overrideLogin(clone.httpClient, true)
+            clone._s4hLoginOverridden = true
+          }
+          return clone
+        },
+        configurable: true
+      })
+
+      return loggedProxy(client, conf)
+    }
+  }
+
+  // Standard OAuth or password auth
   const password = oauthLogin(conf) || conf.password
+  const username = conf.username || ""
   const client = new ADTClient(
     conf.url,
-    conf.username,
+    username,
     password,
     conf.client,
     conf.language,
@@ -313,7 +471,16 @@ export class RemoteManager {
     connectionId = formatKey(connectionId)
     const conn = this.loadRemote(connectionId)
     if (!conn) return // no connection found, should never happen
-    const deleted = await this.clearPassword(connectionId, conn.oauth?.clientId || conn.username)
+
+    // For S4H Public Cloud, also clear the in-memory ticket
+    if (conn.s4hPublicCloud?.enabled) {
+      const { clearS4HTicket } = await import("./oauth/s4hPublicCloud")
+      clearS4HTicket(connectionId)
+    }
+
+    // Determine which credential key to clear
+    const credentialKey = conn.oauth?.clientId || (conn.s4hPublicCloud?.enabled ? "s4h-ticket" : conn.username)
+    const deleted = await this.clearPassword(connectionId, credentialKey)
     if (deleted && !this.isConnected(connectionId)) this.connections.delete(connectionId)
   }
 }

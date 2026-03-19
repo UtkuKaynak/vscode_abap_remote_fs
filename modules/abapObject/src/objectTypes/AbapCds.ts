@@ -2,7 +2,7 @@ import { AbapObjectBase } from "../AbapObject"
 import { AbapObjectCreator } from ".."
 const tag = Symbol("AbapClass")
 
-@AbapObjectCreator("DDLS/DF", "DCLS/DL", "DDLX/EX", "BDEF/BDO", "SRVD/SRV")
+@AbapObjectCreator("DDLS/DF", "DCLS/DL", "DDLX/EX", "BDEF/BDO", "SRVD/SRV", "DSFD/SCF", "DFSD/SCF")
 export class AbapCds extends AbapObjectBase {
   public [tag] = true
   get extension(): string {
@@ -17,6 +17,9 @@ export class AbapCds extends AbapObjectBase {
         return ".bdef.asbdef"
       case "SRVD/SRV": // not properly cds but similar syntax
         return ".srvd.srvdsrv"
+      case "DSFD/SCF": // CDS scalar function definition
+      case "DFSD/SCF": // alternative type code
+        return ".dsfd.asdsfd"
     }
     return ".cds" // should never happen...
   }

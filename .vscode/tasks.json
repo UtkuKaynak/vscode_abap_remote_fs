@@ -56,7 +56,20 @@
       "label": "watch server",
       "script": "watch",
       "path": "server/",
-      "problemMatcher": "$ts-webpack-watch",
+      "problemMatcher": {
+        "owner": "webpack",
+        "pattern": {
+          "regexp": "\\[tsl\\] ERROR in (.*)\\((\\d+),(\\d+)\\)",
+          "file": 1,
+          "line": 2,
+          "column": 3
+        },
+        "background": {
+          "activeOnStart": true,
+          "beginsPattern": "webpack is watching",
+          "endsPattern": "compiled"
+        }
+      },
       "isBackground": true,
       "presentation": {
         "reveal": "never"
@@ -75,7 +88,20 @@
       "label": "watch client",
       "script": "watch",
       "path": "client/",
-      "problemMatcher": "$ts-webpack-watch",
+      "problemMatcher": {
+        "owner": "webpack",
+        "pattern": {
+          "regexp": "\\[tsl\\] ERROR in (.*)\\((\\d+),(\\d+)\\)",
+          "file": 1,
+          "line": 2,
+          "column": 3
+        },
+        "background": {
+          "activeOnStart": true,
+          "beginsPattern": "webpack is watching",
+          "endsPattern": "compiled"
+        }
+      },
       "isBackground": true,
       "presentation": {
         "reveal": "never"

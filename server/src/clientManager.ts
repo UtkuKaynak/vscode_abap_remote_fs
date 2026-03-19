@@ -46,7 +46,8 @@ function debugCallBack(conf: ClientConfiguration) {
     return (data: LogData) => sendHttpLog({ source: SOURCE_SERVER, data, connection: conf.name })
 }
 function createFetchToken(conf: ClientConfiguration) {
-  if (conf.oauth)
+  // Support both OAuth and S4H Public Cloud SSO
+  if (conf.oauth || conf.s4hPublicCloud?.enabled)
     return () => connection.sendRequest(Methods.getToken, conf.name) as Promise<string>
 }
 
@@ -57,9 +58,11 @@ const refreshClient = (key: string, conf: ClientConfiguration) => {
     : {}
   sslconf.debugCallback = debugCallBack(conf)
   const pwdOrFetch = createFetchToken(conf) || conf.password
+  // For S4H Public Cloud, use placeholder username if not set (same as createClient in config.ts)
+  const username = conf.username || (conf.s4hPublicCloud?.enabled ? "S4H_SSO_USER" : "")
   const baseclient = new ADTClient(
     conf.url,
-    conf.username,
+    username,
     pwdOrFetch,
     conf.client,
     conf.language,

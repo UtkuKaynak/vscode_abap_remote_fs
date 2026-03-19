@@ -29,3 +29,15 @@ server/src/**/*.js
 server/src/**/*.js.map
 modules/*/src/**/*.js
 modules/*/src/**/*.js.map
+
+#decompiled ADT jar files
+adt_decompiled
+
+#ai agent files
+.claude
+
+#documentation
+docs
+
+#Windows reserved names
+nul

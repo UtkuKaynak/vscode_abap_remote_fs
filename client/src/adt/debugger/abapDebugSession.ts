@@ -4,7 +4,7 @@ import { DEBUGTYPE } from "./abapConfigurationProvider"
 import { DebugProtocol } from "@vscode/debugprotocol"
 import { getRoot } from "../conections"
 import { isAbapFile } from "abapfs"
-import { caughtToString } from "../../lib"
+import { caughtToString, log } from "../../lib"
 import { DebugListener, errorType } from "./debugListener"
 
 export interface AbapDebugConfiguration extends DebugConfiguration {
@@ -23,6 +23,9 @@ export class AbapDebugSession extends LoggingDebugSession {
     return this.sessions.size
   }
   private lasttargetId = 0
+  // Promise that resolves when attachRequest completes - breakpoints wait on this
+  private attachReady: Promise<void>
+  private resolveAttachReady!: () => void
   static byConnection(connId: string) {
     return AbapDebugSession.sessions.get(connId)
   }
@@ -40,6 +43,10 @@ export class AbapDebugSession extends LoggingDebugSession {
       throw new Error(`Debug session already running on ${connId}`)
     AbapDebugSession.sessions.set(connId, this)
     listener.addListener(e => this.sendEvent(e))
+    // Initialize the attach gate - setBreakPointsRequest will wait on this
+    this.attachReady = new Promise(resolve => {
+      this.resolveAttachReady = resolve
+    })
   }
 
   protected dispatchRequest(request: DebugProtocol.Request) {
@@ -51,7 +58,15 @@ export class AbapDebugSession extends LoggingDebugSession {
     request?: DebugProtocol.Request
   ) {
     const { source, breakpoints = [] } = args
+    log(`setBreakPointsRequest: source=${source.path}, breakpoints=${breakpoints.length} (lines: ${breakpoints.map(b => b.line).join(',')})`)
+    // Wait for attachRequest to complete before registering breakpoints
+    // VS Code sends setBreakPointsRequest concurrently with attachRequest after InitializedEvent
+    // We need to ensure the listener is fully established before registering breakpoints
+    log(`setBreakPointsRequest: waiting for attach to complete...`)
+    await this.attachReady
+    log(`setBreakPointsRequest: attach complete, now registering breakpoints`)
     const bpps = await this.listener.breakpointManager.setBreakpoints(source, breakpoints)
+    log(`setBreakPointsRequest: result=${bpps.length} breakpoints, verified=${bpps.filter(b => b.verified).length}`)
     response.body = { breakpoints: bpps }
     this.sendResponse(response)
   }
@@ -126,11 +141,17 @@ export class AbapDebugSession extends LoggingDebugSession {
     args: DebugProtocol.AttachRequestArguments,
     request?: DebugProtocol.Request
   ) {
+    log(`attachRequest: starting fireMainLoop...`)
     response.success = await this.listener.fireMainLoop()
+    log(`attachRequest: fireMainLoop returned ${response.success}`)
     if (!response.success) {
       response.message = "Could not attach to process"
     }
+    // Signal that attach is complete - this unblocks setBreakPointsRequest
+    log(`attachRequest: signaling attach complete to unblock breakpoint registration`)
+    this.resolveAttachReady()
     this.sendResponse(response)
+    log(`attachRequest: response sent`)
   }
 
   protected configurationDoneRequest(

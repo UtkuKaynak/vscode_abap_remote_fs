@@ -113,7 +113,7 @@
         "configurationAttributes": {
           "attach": {
             "required": [
-              "root"
+              "connId"
             ],
             "properties": {
               "connId": {
@@ -3673,6 +3673,7 @@
                 },
                 "oauth": {
                   "type": "object",
+                  "description": "OAuth configuration for SAP BTP/Cloud Foundry",
                   "properties": {
                     "clientId": {
                       "type": "string",
@@ -3695,6 +3696,27 @@
                     "clientId",
                     "clientSecret",
                     "loginUrl"
+                  ]
+                },
+                "s4hPublicCloud": {
+                  "type": "object",
+                  "description": "S4/HANA Public Cloud configuration with browser-based SSO authentication",
+                  "properties": {
+                    "enabled": {
+                      "type": "boolean",
+                      "title": "Enable S4/HANA Public Cloud authentication",
+                      "description": "When enabled, uses browser-based SSO authentication via reentrance ticket (same as Eclipse ADT)",
+                      "default": false
+                    },
+                    "saveCredentials": {
+                      "type": "boolean",
+                      "title": "Save authentication ticket",
+                      "description": "Persist authentication ticket for session continuity",
+                      "default": false
+                    }
+                  },
+                  "required": [
+                    "enabled"
                   ]
                 },
                 "trace": {

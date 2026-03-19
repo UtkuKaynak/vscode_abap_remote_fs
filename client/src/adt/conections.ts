@@ -6,8 +6,12 @@ import { LogOutPendingDebuggers } from "./debugger"
 import { SapSystemValidator } from "../services/sapSystemValidator"
 import { LocalFsProvider } from "../fs/LocalFsProvider"
 import { log } from "../lib"
+import { discoverS4HUrls } from "../oauth/s4hPublicCloud"
+import { ReleasedObjectsFolder } from "./releasedObjectsFolder"
+
 export const ADTSCHEME = "adt"
 export const ADTURIPATTERN = /\/sap\/bc\/adt\//
+export const RELEASED_OBJECTS_FOLDER = "Released Objects"
 
 const roots = new Map<string, Root>()
 const clients = new Map<string, ADTClient>()
@@ -35,7 +39,13 @@ async function create(connId: string) {
   log(`✅ SAP system validation passed for: ${connId}`)
 
   let client
-  if (connection.oauth || connection.password) {
+  if (connection.oauth || connection.s4hPublicCloud?.enabled || connection.password) {
+    // CRITICAL: For S4H Public Cloud, discover the API URL BEFORE creating the client
+    // S4H has separate API and UI hosts - the ADTClient must be created with the API URL
+    if (connection.s4hPublicCloud?.enabled) {
+      await discoverS4HUrls(connection.url)
+    }
+
     client = createClient(connection)
     await client.login() // raise exception for login issues
     await client.statelessClone.login()
@@ -125,6 +135,24 @@ async function create(connId: string) {
   // @ts-ignore
   const service = new AFsService(client)
   const newRoot = new Root(connId, service)
+
+  // Add Released Objects folder for S4H Public Cloud (or systems that support it)
+  // This provides the Eclipse ADT-style view of objects organized by API stability contracts
+  try {
+    const releasedFolder = new ReleasedObjectsFolder(client)
+    // Check if the API is available before adding the folder
+    const isAvailable = await releasedFolder.isAvailable()
+    if (isAvailable) {
+      newRoot.set(RELEASED_OBJECTS_FOLDER, releasedFolder, true)
+      log(`[Released Objects] Virtual folders API available for ${connId}`)
+    } else {
+      log(`[Released Objects] Virtual folders API not available for ${connId}`)
+    }
+  } catch (error) {
+    // Don't fail connection if Released Objects folder can't be added
+    log(`[Released Objects] Failed to check availability: ${error}`)
+  }
+
   roots.set(connId, newRoot)
   clients.set(connId, client)
 }

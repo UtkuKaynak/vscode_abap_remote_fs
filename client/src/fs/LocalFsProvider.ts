@@ -51,8 +51,24 @@ export class LocalFsProvider implements FileSystemProvider {
         watcher = workspace.createFileSystemWatcher(new RelativePattern(resolved, pattern))
         const mapAndFire = (type: FileChangeType, u: Uri) => {
           // compute path relative to resolved root
+          // Use case-insensitive comparison on Windows and handle URL encoding
           let rel = u.path
-          if (rel.startsWith(resolved.path)) rel = rel.substring(resolved.path.length)
+          const resolvedPathLower = resolved.path.toLowerCase()
+          const relLower = rel.toLowerCase()
+          if (relLower.startsWith(resolvedPathLower)) {
+            rel = rel.substring(resolved.path.length)
+          } else {
+            // Try decoding both paths for comparison (handles %3A vs : differences)
+            try {
+              const decodedResolved = decodeURIComponent(resolved.path).toLowerCase()
+              const decodedRel = decodeURIComponent(rel).toLowerCase()
+              if (decodedRel.startsWith(decodedResolved)) {
+                rel = rel.substring(resolved.path.length)
+              }
+            } catch {
+              // Decoding failed, keep original path
+            }
+          }
           if (!rel.startsWith("/")) rel = `/${rel}`
           const remote = Uri.parse(`${uri.scheme}://${uri.authority}${rel}`)
           this.pEventEmitter.fire([{ type, uri: remote }])

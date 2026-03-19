@@ -123,7 +123,9 @@ async function objectDetailFromUrl(url: string) {
 }
 
 export async function configFromKey(connId: string) {
-  const { sapGui, ...cfg } = (await RemoteManager.get()).byId(connId)!
+  const conn = await RemoteManager.get().byIdAsync(connId)
+  if (!conn) throw new Error(`Connection not found: ${connId}`)
+  const { sapGui, ...cfg } = conn
   return cfg
 }
 async function getToken(connId: string) {

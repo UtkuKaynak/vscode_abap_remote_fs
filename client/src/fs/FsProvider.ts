@@ -16,7 +16,15 @@ import {
   workspace
 } from "vscode"
 import { caughtToString, log } from "../lib"
-import { isAbapFile, isAbapFolder, isFolder } from "abapfs"
+import { isAbapFile, isAbapFolder, isFolder, isRefreshable, AbapFolder } from "abapfs"
+import {
+  isReleasedObjectsFolder,
+  isContractFolder,
+  isCategoryFolder,
+  isObjectTypeFolder,
+  isReleasedObject,
+  ReleasedObject
+} from "../adt/releasedObjectsFolder"
 import { getSaveReason, clearSaveReason } from "../listeners"
 import { selectTransportIfNeeded } from "../adt/AdtTransports"
 import { LocalFsProvider } from "./LocalFsProvider"
@@ -47,6 +55,20 @@ const loadFromEditor = async (
       return Buffer.from(cachedEditorContent)
     }
   }
+}
+
+/**
+ * Find the main include path for an AbapFolder (class, interface, etc.)
+ */
+const findMainIncludePath = async (folder: AbapFolder, basePath: string): Promise<string | undefined> => {
+  // First try to get the main include directly
+  let main = folder.mainInclude(basePath)
+  if (main) return main.path
+
+  // If not found, refresh the folder and try again
+  await folder.refresh()
+  main = folder.mainInclude(basePath)
+  return main?.path
 }
 
 const openInGui = (uri: Uri, contents: string) => {
@@ -154,6 +176,53 @@ export class FsProvider implements FileSystemProvider {
     try {
       const root = await getOrCreateRoot(uri.authority)
       const node = await root.getNodeAsync(uri.path)
+
+      // Handle ReleasedObject - redirect to the actual ABAP object
+      if (isReleasedObject(node)) {
+        // The ReleasedObject.uri contains the ADT object path (e.g., "/sap/bc/adt/oo/classes/aic_choices")
+        // We need to use root.findByAdtUri to find the VS Code filesystem path for this object
+        const releasedObj = node as ReleasedObject
+        const adtPath = releasedObj.uri
+        if (adtPath) {
+          try {
+            // NOTE: Do NOT decode the URI - namespaced objects like /SCWM/CL_... have their
+            // slashes URL-encoded as %2f and the ADT API expects them to stay encoded.
+            // Decoding would create invalid URIs like /sap/bc/adt/oo/classes//scwm/... (double slash)
+            log(`[Released Objects] Opening object: name=${releasedObj.name}, type=${releasedObj.objectType}, adtPath=${adtPath}`)
+
+            // Use findByAdtUri to locate the object in the VS Code filesystem
+            // The second parameter (main=true) tells it to find the main source include
+            const found = await root.findByAdtUri(adtPath, true)
+            if (found?.path && isAbapFile(found.file)) {
+              log(`[Released Objects] Found object at path: ${found.path}`)
+              const contents = await found.file.read()
+              openInGui(uri, contents)
+              return Buffer.from(contents)
+            } else if (found?.path && isAbapFolder(found.file)) {
+              // It's a folder (like a class), find the main include
+              log(`[Released Objects] Found folder at path: ${found.path}, looking for main include`)
+              const mainPath = await findMainIncludePath(found.file, found.path)
+              if (mainPath) {
+                const mainNode = await root.getNodeAsync(mainPath)
+                if (isAbapFile(mainNode)) {
+                  log(`[Released Objects] Found main include at: ${mainPath}`)
+                  const contents = await mainNode.read()
+                  openInGui(uri, contents)
+                  return Buffer.from(contents)
+                }
+              }
+            } else {
+              log(`[Released Objects] Could not find object at ADT path: ${adtPath}`)
+            }
+          } catch (e) {
+            log(`[Released Objects] Error loading object from ADT path ${adtPath}: ${caughtToString(e)}`)
+          }
+        } else {
+          log(`[Released Objects] No ADT URI for object: ${releasedObj.name}`)
+        }
+        throw FileSystemError.Unavailable(uri)
+      }
+
       if (isAbapFile(node)) {
         // const fromEditor = await loadFromEditor(uri, this.editorContentCache)
         // if (fromEditor) return fromEditor
@@ -176,7 +245,16 @@ export class FsProvider implements FileSystemProvider {
       const root = await getOrCreateRoot(uri.authority)
       const node = await root.getNodeAsync(uri.path)
       if (!isFolder(node)) throw FileSystemError.FileNotFound(uri)
+
+      // Refresh AbapFolder if empty
       if (isAbapFolder(node) && node.size === 0) await node.refresh()
+
+      // Refresh Released Objects folders on first access
+      if (isReleasedObjectsFolder(node) && node.size === 0) await node.refresh()
+      if (isContractFolder(node) && node.size === 0) await node.refresh()
+      if (isCategoryFolder(node) && node.size === 0) await node.refresh()
+      if (isObjectTypeFolder(node) && node.size === 0) await node.refresh()
+
       const files: [string, FileType][] = [...node].map(i => [i.name, i.file.type])
       if (uri.path === "/") {
         const localfiles = await this.localProvider.readDirectory(uri)

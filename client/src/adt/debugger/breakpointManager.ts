@@ -1,4 +1,4 @@
-import { DebugBreakpoint, isDebuggerBreakpoint } from "abap-adt-api"
+import { ADTClient, DebugBreakpoint, isDebuggerBreakpoint } from "abap-adt-api"
 import { AbapFile, isAbapFile } from "abapfs"
 import { Uri } from "vscode"
 import { Breakpoint, Source } from "@vscode/debugadapter"
@@ -38,6 +38,7 @@ export class BreakpointManager {
   public getBreakpoints(path: string) {
     return this.breakpoints.get(path) || []
   }
+
   public async setBreakpoints(
     source: DebugProtocol.Source,
     breakpoints: DebugProtocol.SourceBreakpoint[]
@@ -88,6 +89,25 @@ export class BreakpointManager {
             .catch(ignore)
     }
   }
+  /**
+   * Get the client to use for breakpoint operations.
+   *
+   * For S4H Public Cloud: Use main client directly. The debuggee will be registered
+   * on whichever session sets the breakpoint. If we use statelessClone, the debuggee
+   * will be registered on that session, but our listener runs on the main client,
+   * causing "invalidDebuggee" errors when we try to attach.
+   *
+   * For other auth types: Use statelessClone as before.
+   */
+  private getBreakpointClient(): ADTClient {
+    if (this.listener.isS4H) {
+      // S4H: Use main client - breakpoints must be on same session as listener
+      return getClient(this.listener.connId, false)
+    }
+    // Non-S4H: Use statelessClone
+    return getClient(this.listener.connId).statelessClone
+  }
+
   private async syncBreakpoints(
     node: AbapFile,
     breakpoints: DebugProtocol.SourceBreakpoint[],
@@ -128,17 +148,18 @@ export class BreakpointManager {
     const uri = Uri.parse(path)
     const clientId = `24:${this.listener.connId}${uri.path}`
     const oldbps = this.getBreakpoints(path)
-    const client = getClient(this.listener.connId)
+    // Get the appropriate client for breakpoint operations
+    const bpClient = this.getBreakpointClient()
     const deleted = oldbps
       .map(o => o.adtBp)
       .filter(isDefined)
       .filter(o => !breakpoints.find(b => b.line === o.uri.range.start.line))
     for (const bp of deleted)
-      await client.statelessClone
+      await bpClient
         .debuggerDeleteBreakpoints(bp, "user", this.terminalId, this.ideId, this.username)
         .catch(ignore)
     let actualbps: DebugBreakpoint[] = []
-    actualbps = await client.statelessClone
+    actualbps = await bpClient
       .debuggerSetBreakpoints(
         this.mode,
         this.terminalId,
@@ -163,7 +184,7 @@ export class BreakpointManager {
         if (cond?.condition) return { ...b, condition: cond.condition }
         return b
       })
-      actualbps = await client.statelessClone
+      actualbps = await bpClient
         .debuggerSetBreakpoints(
           this.mode,
           this.terminalId,
